@@ -4,7 +4,7 @@
 
 * Setup a raspberry pi pico.
     * Setup a raspberry pico to use micropython
-        * see `https://micropython.org/download/RPI_PICO2/`
+        * see https://micropython.org/download/RPI_PICO2/
     * Install the mpremote
         * `pip install mpremote`
     * Copy the scripts in `pico_micropython/` 
