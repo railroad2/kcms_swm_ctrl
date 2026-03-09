@@ -1,0 +1,23 @@
+[Unit]
+Description=Switch Matrix WebSocket Gateway
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=lgad
+Group=lgad
+WorkingDirectory=/home/lgad/websocket_server
+ExecStart=/usr/bin/python3 /home/lgad/kcms_swm_ctrl/websocket_server/ws_gateway.py
+Restart=always
+RestartSec=2
+
+# Environment tuning
+Environment=PYTHONUNBUFFERED=1
+
+# Journal logging
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
