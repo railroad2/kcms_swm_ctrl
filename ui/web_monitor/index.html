@@ -11,12 +11,12 @@
         <header class="topbar">
             <div>
                 <h1>16×16 Switch Matrix Monitor</h1>
-                <p class="subtitle">Read-only real-time status monitor</p>
+                <p class="subtitle">Real-time status monitor</p>
             </div>
 
             <div class="status-panel">
                 <div class="status-row">
-                    <span class="status-label">Gateway</span>
+                    <span class="status-label">Status</span>
                     <span id="ws-state" class="badge disconnected">Disconnected</span>
                 </div>
                 <div class="status-row">
@@ -34,15 +34,6 @@
             </div>
         </header>
 
-        <section class="toolbar-card">
-            <div class="toolbar">
-                <button id="refresh-btn" class="btn">Refresh</button>
-            </div>
-            <p class="toolbar-help">
-                This page is monitor-only. Control is handled separately by sw_control.py.
-            </p>
-        </section>
-
         <section class="matrix-card">
             <div class="matrix-wrapper">
                 <div id="matrix-root"></div>
@@ -52,6 +43,15 @@
         <section class="active-card">
             <h2>Active channels</h2>
             <div id="active-list" class="active-list">(none)</div>
+        </section>
+
+        <section class="toolbar-card">
+            <div class="toolbar">
+                <button id="refresh-btn" class="btn">Refresh</button>
+            </div>
+            <p class="toolbar-help">
+                This page is monitor-only. Control is handled separately by sw_control.py.
+            </p>
         </section>
     </main>
 
