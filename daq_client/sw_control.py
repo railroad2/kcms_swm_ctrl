@@ -9,10 +9,22 @@ This tool is intended to run on the DAQ PC or on the Raspberry Pi itself.
 All switch control goes through the WebSocket gateway, which should be the
 only owner of the Pico UART port.
 
+Endpoint model
+--------------
+- monitor endpoint:
+    /monitor
+    gateway commands only
+    subscribe / unsubscribe / get / ping / map
+
+- control endpoint:
+    /control
+    Pico commands only
+    ON / OFF / ALLOFF / PINSTAT / PCFSTAT / PING
+
 Supported commands
 ------------------
 ping
-    Ping the gateway and Pico.
+    Ping both the gateway and Pico.
 
 on <pin expressions...>
     Turn ON one or more channels.
@@ -41,12 +53,16 @@ map
     Print matrix label -> linear pin mapping.
 
 watch
-    Subscribe to gateway state updates and redraw the matrix continuously.
+    Poll PINSTAT ALL repeatedly through /control and redraw the matrix.
+
+follow
+    Subscribe to monitor updates through /monitor and redraw on events.
 """
 
 import argparse
 import json
 import sys
+import time
 from typing import Dict, List
 
 from daq_client_sync import DAQClientSync
@@ -209,15 +225,13 @@ def active_labels_from_pins(pins: List[int]) -> List[str]:
     return labels
 
 
-def draw_watch_screen(uri: str, pins: List[int], event_name: str, color: bool, frame: bool) -> None:
-    """
-    Redraw terminal watch screen with matrix and active-channel list.
-    """
+def draw_watch_screen(title: str, uri: str, pins: List[int], event_name: str, color: bool, frame: bool) -> None:
+    """Redraw terminal watch/follow screen with matrix and active-channel list."""
     clear_screen()
 
     active = active_labels_from_pins(pins)
 
-    print("Switching Matrix Watch")
+    print(title)
     print(f"Gateway: {uri}")
     print(f"Event: {event_name}")
     print(f"Active channels: {len(active)}")
@@ -237,132 +251,214 @@ def draw_watch_screen(uri: str, pins: List[int], event_name: str, color: bool, f
         print(" ".join(active[i:i + per_line]))
 
 
-def cmd_ping(client: DAQClientSync, args: argparse.Namespace) -> int:
+def strip_endpoint_suffix(uri: str) -> str:
+    """Strip trailing /monitor or /control from URI if present."""
+    if uri.endswith("/monitor"):
+        return uri[:-8]
+    if uri.endswith("/control"):
+        return uri[:-8]
+    return uri.rstrip("/")
+
+
+def derived_monitor_uri(args: argparse.Namespace) -> str:
+    """Return monitor URI from explicit option or base URI."""
+    if args.monitor_uri:
+        return args.monitor_uri
+    return strip_endpoint_suffix(args.uri) + "/monitor"
+
+
+def derived_control_uri(args: argparse.Namespace) -> str:
+    """Return control URI from explicit option or base URI."""
+    if args.control_uri:
+        return args.control_uri
+    return strip_endpoint_suffix(args.uri) + "/control"
+
+
+def cmd_ping(args: argparse.Namespace) -> int:
     """Handle ping command."""
-    client.gateway_ping()
-    client.ping()
+    monitor_uri = derived_monitor_uri(args)
+    control_uri = derived_control_uri(args)
+
+    with DAQClientSync(monitor_uri, timeout=args.timeout) as monitor_client:
+        monitor_client.gateway_ping()
+
+    with DAQClientSync(control_uri, timeout=args.timeout) as control_client:
+        control_client.ping()
+
     print("PONG")
     return 0
 
 
-def cmd_on(client: DAQClientSync, args: argparse.Namespace) -> int:
+def cmd_on(args: argparse.Namespace) -> int:
     """Handle on command."""
-    client.on(*args.pins)
+    with DAQClientSync(derived_control_uri(args), timeout=args.timeout) as client:
+        client.on(*args.pins)
     print("SUCCESS")
     return 0
 
 
-def cmd_off(client: DAQClientSync, args: argparse.Namespace) -> int:
+def cmd_off(args: argparse.Namespace) -> int:
     """Handle off command."""
-    if len(args.pins) == 1 and args.pins[0].strip().lower() == "all":
-        client.alloff()
-    else:
-        client.off(*args.pins)
+    with DAQClientSync(derived_control_uri(args), timeout=args.timeout) as client:
+        if len(args.pins) == 1 and args.pins[0].strip().lower() == "all":
+            client.alloff()
+        else:
+            client.off(*args.pins)
     print("SUCCESS")
     return 0
 
 
-def cmd_alloff(client: DAQClientSync, args: argparse.Namespace) -> int:
+def cmd_alloff(args: argparse.Namespace) -> int:
     """Handle alloff command."""
-    client.alloff()
+    with DAQClientSync(derived_control_uri(args), timeout=args.timeout) as client:
+        client.alloff()
     print("SUCCESS")
     return 0
 
 
-def cmd_route(client: DAQClientSync, args: argparse.Namespace) -> int:
+def cmd_route(args: argparse.Namespace) -> int:
     """Handle route command."""
-    client.route(*args.target)
+    with DAQClientSync(derived_control_uri(args), timeout=args.timeout) as client:
+        client.route(*args.target)
     print("SUCCESS")
     return 0
 
 
-def cmd_pinstat(client: DAQClientSync, args: argparse.Namespace) -> int:
+def cmd_pinstat(args: argparse.Namespace) -> int:
     """Handle pinstat command."""
-    arg = args.arg
+    with DAQClientSync(derived_control_uri(args), timeout=args.timeout) as client:
+        arg = args.arg
 
-    if arg == "active":
-        labels = client.active_labels()
-        print_active_labels(labels)
-        return 0
+        if arg == "active":
+            labels = client.active_labels()
+            print_active_labels(labels)
+            return 0
 
-    if arg is None or arg.upper() == "ALL":
-        resp = client.pinstat("ALL")
+        if arg is None or arg.upper() == "ALL":
+            resp = client.pinstat("ALL")
+            pins = resp["pins"]
+            print_matrix(
+                pins,
+                color=not args.no_color,
+                frame=not args.no_frame,
+            )
+            return 0
+
+        which = int(arg)
+        resp = client.pinstat(which)
         pins = resp["pins"]
-        print_matrix(
-            pins,
-            color=not args.no_color,
-            frame=not args.no_frame,
-        )
+        print(json.dumps(pins))
         return 0
 
-    which = int(arg)
-    resp = client.pinstat(which)
-    pins = resp["pins"]
-    print(json.dumps(pins))
-    return 0
 
-
-def cmd_pcfstat(client: DAQClientSync, args: argparse.Namespace) -> int:
+def cmd_pcfstat(args: argparse.Namespace) -> int:
     """Handle pcfstat command."""
-    arg = args.arg
+    with DAQClientSync(derived_control_uri(args), timeout=args.timeout) as client:
+        arg = args.arg
 
-    if arg is None or arg.upper() == "ALL":
-        resp = client.pcfstat("ALL")
-        present = resp["present"]
-        print_pcf_all(
-            present,
-            color=not args.no_color,
-            frame=not args.no_frame,
-        )
+        if arg is None or arg.upper() == "ALL":
+            resp = client.pcfstat("ALL")
+            present = resp["present"]
+            print_pcf_all(
+                present,
+                color=not args.no_color,
+                frame=not args.no_frame,
+            )
+            return 0
+
+        which = int(arg)
+        resp = client.pcfstat(which)
+        print(resp["present"])
         return 0
 
-    which = int(arg)
-    resp = client.pcfstat(which)
-    print(resp["present"])
-    return 0
 
-
-def cmd_map(client: DAQClientSync, args: argparse.Namespace) -> int:
+def cmd_map(args: argparse.Namespace) -> int:
     """Handle map command."""
-    mapping = client.pin_map()
+    with DAQClientSync(derived_monitor_uri(args), timeout=args.timeout) as client:
+        mapping = client.pin_map()
     print_map(mapping)
     return 0
 
 
-def cmd_watch(client: DAQClientSync, args: argparse.Namespace) -> int:
+def cmd_watch(args: argparse.Namespace) -> int:
     """
     Handle watch command.
 
     Behavior:
-    - subscribe to gateway updates
+    - poll PINSTAT ALL repeatedly through /control
+    - redraw continuously
+
+    This keeps watch working even though subscribe is now /monitor-only.
+    """
+    color = not args.no_color
+    frame = not args.no_frame
+    control_uri = derived_control_uri(args)
+
+    with DAQClientSync(control_uri, timeout=args.timeout) as client:
+        while True:
+            resp = client.pinstat("ALL")
+            pins = resp["pins"]
+            draw_watch_screen(
+                "Switching Matrix Watch (polling)",
+                control_uri,
+                pins,
+                "poll",
+                color=color,
+                frame=frame,
+            )
+            time.sleep(args.interval)
+
+
+def cmd_follow(args: argparse.Namespace) -> int:
+    """
+    Handle follow command.
+
+    Behavior:
+    - subscribe to monitor updates through /monitor
     - use subscribe snapshot as initial state
     - wait indefinitely for pinstat_update / pinstat_snapshot events
     """
     color = not args.no_color
     frame = not args.no_frame
+    monitor_uri = derived_monitor_uri(args)
 
-    sub_resp = client.subscribe()
+    with DAQClientSync(monitor_uri, timeout=args.timeout) as client:
+        sub_resp = client.subscribe()
 
-    try:
-        snapshot = sub_resp["snapshot"]
-        pins = extract_pins_from_event(snapshot)
-        draw_watch_screen(args.uri, pins, "pinstat_snapshot", color=color, frame=frame)
-
-        while True:
-            event = client.recv_event(timeout=None)
-            name = event.get("event")
-
-            if name not in ("pinstat_update", "pinstat_snapshot"):
-                continue
-
-            pins = extract_pins_from_event(event)
-            draw_watch_screen(args.uri, pins, str(name), color=color, frame=frame)
-
-    finally:
         try:
-            client.unsubscribe()
-        except Exception:
-            pass
+            snapshot = sub_resp["snapshot"]
+            pins = extract_pins_from_event(snapshot)
+            draw_watch_screen(
+                "Switching Matrix Follow (event-driven)",
+                monitor_uri,
+                pins,
+                "pinstat_snapshot",
+                color=color,
+                frame=frame,
+            )
+
+            while True:
+                event = client.recv_event(timeout=None)
+                name = event.get("event")
+
+                if name not in ("pinstat_update", "pinstat_snapshot"):
+                    continue
+
+                pins = extract_pins_from_event(event)
+                draw_watch_screen(
+                    "Switching Matrix Follow (event-driven)",
+                    monitor_uri,
+                    pins,
+                    str(name),
+                    color=color,
+                    frame=frame,
+                )
+
+        finally:
+            try:
+                client.unsubscribe()
+            except Exception:
+                pass
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -372,7 +468,19 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--uri",
         default="ws://127.0.0.1:8765",
-        help="gateway websocket URI",
+        help="base gateway websocket URI without endpoint suffix",
+    )
+
+    parser.add_argument(
+        "--monitor-uri",
+        default=None,
+        help="explicit monitor endpoint URI override",
+    )
+
+    parser.add_argument(
+        "--control-uri",
+        default=None,
+        help="explicit control endpoint URI override",
     )
 
     parser.add_argument(
@@ -417,10 +525,21 @@ def build_parser() -> argparse.ArgumentParser:
     p_map = sub.add_parser("map", help="print matrix label to pin mapping")
     p_map.set_defaults(func=cmd_map)
 
-    p_watch = sub.add_parser("watch", help="subscribe and watch live state updates")
+    p_watch = sub.add_parser("watch", help="poll live state through /control")
+    p_watch.add_argument(
+        "--interval",
+        type=float,
+        default=1.0,
+        help="poll interval in seconds",
+    )
     p_watch.add_argument("--no-color", action="store_true", help="disable ANSI colors")
     p_watch.add_argument("--no-frame", action="store_true", help="disable frame border")
     p_watch.set_defaults(func=cmd_watch)
+
+    p_follow = sub.add_parser("follow", help="subscribe and follow live state through /monitor")
+    p_follow.add_argument("--no-color", action="store_true", help="disable ANSI colors")
+    p_follow.add_argument("--no-frame", action="store_true", help="disable frame border")
+    p_follow.set_defaults(func=cmd_follow)
 
     return parser
 
@@ -435,8 +554,7 @@ def main() -> int:
         return 1
 
     try:
-        with DAQClientSync(args.uri, timeout=args.timeout) as client:
-            return args.func(client, args)
+        return args.func(args)
     except KeyboardInterrupt:
         return 130
     except Exception as exc:
@@ -446,4 +564,3 @@ def main() -> int:
 
 if __name__ == "__main__":
     sys.exit(main())
-

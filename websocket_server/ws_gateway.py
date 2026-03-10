@@ -9,7 +9,8 @@ Features
 - One UART command at a time
 - Ignore non-JSON UART noise
 - Cache latest PINSTAT ALL result
-- Subscription / broadcast for state updates
+- Separate monitor/control websocket endpoints
+- Broadcast state updates to monitor subscribers only
 - Graceful handling of normal websocket disconnects
 - Compact operational logging
 """
@@ -230,7 +231,28 @@ class Gateway:
         self.pico = pico
         self.lock = asyncio.Lock()
         self.last_pinstat_all: Optional[Dict[str, Any]] = None
-        self.subscribers: Set[Any] = set()
+        self.monitor_subscribers: Set[Any] = set()
+
+    def websocket_path(self, websocket: Any, path_hint: Optional[str] = None) -> str:
+        """
+        Return normalized websocket request path.
+
+        Compatible with multiple websockets versions.
+        """
+        if isinstance(path_hint, str) and path_hint:
+            return path_hint.split("?", 1)[0]
+
+        path = getattr(websocket, "path", None)
+        if isinstance(path, str):
+            return path.split("?", 1)[0]
+
+        request = getattr(websocket, "request", None)
+        if request is not None:
+            req_path = getattr(request, "path", None)
+            if isinstance(req_path, str):
+                return req_path.split("?", 1)[0]
+
+        return "/"
 
     async def pico_send(self, payload: Dict[str, Any]) -> Dict[str, Any]:
         """
@@ -302,10 +324,8 @@ class Gateway:
         })
 
     async def broadcast_state_update(self) -> None:
-        """
-        Broadcast latest state snapshot to all subscribers.
-        """
-        if not self.subscribers:
+        """Broadcast latest state snapshot to monitor subscribers only."""
+        if not self.monitor_subscribers:
             return
 
         try:
@@ -323,23 +343,27 @@ class Gateway:
 
         dead = []
 
-        for ws in list(self.subscribers):
+        for ws in list(self.monitor_subscribers):
             ok = await safe_send_json(ws, payload)
             if not ok:
                 dead.append(ws)
 
         for ws in dead:
-            self.subscribers.discard(ws)
+            self.monitor_subscribers.discard(ws)
 
         log.info(
-            "Broadcasted pinstat_update to %d subscribers",
-            len(self.subscribers),
+            "Broadcasted pinstat_update to %d monitor subscribers",
+            len(self.monitor_subscribers),
         )
 
-    async def subscribe(self, websocket: Any) -> Dict[str, Any]:
-        """Register websocket as subscriber and send current snapshot."""
-        self.subscribers.add(websocket)
-        log.info("Subscriber added: %s (total=%d)", peer_name(websocket), len(self.subscribers))
+    async def subscribe_monitor(self, websocket: Any) -> Dict[str, Any]:
+        """Register websocket as monitor subscriber and send current snapshot."""
+        self.monitor_subscribers.add(websocket)
+        log.info(
+            "Monitor subscriber added: %s (total=%d)",
+            peer_name(websocket),
+            len(self.monitor_subscribers),
+        )
 
         try:
             ok = await self.send_snapshot(
@@ -347,40 +371,106 @@ class Gateway:
                 cached_flag=1 if self.last_pinstat_all else 0,
             )
         except Exception as exc:
-            self.subscribers.discard(websocket)
+            self.monitor_subscribers.discard(websocket)
             return json_error(str(exc))
 
         if not ok:
-            self.subscribers.discard(websocket)
+            self.monitor_subscribers.discard(websocket)
             return json_error("websocket closed during subscribe")
 
         return {
             "ok": 1,
             "event": "subscribed",
             "source": "gateway",
+            "channel": "monitor",
         }
 
-    async def unsubscribe(self, websocket: Any) -> Dict[str, Any]:
-        """Remove websocket from subscriber set."""
-        self.subscribers.discard(websocket)
-        log.info("Subscriber removed: %s (total=%d)", peer_name(websocket), len(self.subscribers))
+    async def unsubscribe_monitor(self, websocket: Any) -> Dict[str, Any]:
+        """Remove websocket from monitor subscriber set."""
+        self.monitor_subscribers.discard(websocket)
+        log.info(
+            "Monitor subscriber removed: %s (total=%d)",
+            peer_name(websocket),
+            len(self.monitor_subscribers),
+        )
 
         return {
             "ok": 1,
             "event": "unsubscribed",
             "source": "gateway",
+            "channel": "monitor",
         }
 
-    async def handle(self, websocket) -> None:
+    async def handle_monitor(self, websocket: Any, payload: Dict[str, Any]) -> Dict[str, Any]:
+        """Handle monitor-only commands."""
+        gateway_cmd = payload.get("gateway")
+
+        if gateway_cmd == "ping":
+            return {
+                "ok": 1,
+                "event": "gateway_pong",
+                "source": "gateway",
+                "channel": "monitor",
+            }
+
+        if gateway_cmd == "get":
+            return await self.gateway_get()
+
+        if gateway_cmd == "map":
+            return {
+                "ok": 1,
+                "event": "map",
+                "source": "gateway",
+                "map": build_pin_map(),
+            }
+
+        if gateway_cmd == "subscribe":
+            return await self.subscribe_monitor(websocket)
+
+        if gateway_cmd == "unsubscribe":
+            return await self.unsubscribe_monitor(websocket)
+
+        return json_error(
+            "monitor endpoint accepts only gateway commands",
+            path="/monitor",
+        )
+
+    async def handle_control(self, payload: Dict[str, Any]) -> Dict[str, Any]:
+        """Handle control-only commands."""
+        if "gateway" in payload:
+            return json_error(
+                "control endpoint does not accept gateway commands",
+                path="/control",
+            )
+
+        try:
+            resp = await self.pico_send(payload)
+        except Exception as exc:
+            log.warning("Control command failure: %s", exc)
+            return json_error(str(exc))
+
+        if (
+            isinstance(resp, dict)
+            and resp.get("ok") == 1
+            and resp.get("cmd") in ("ON", "OFF", "ALLOFF")
+        ):
+            await self.broadcast_state_update()
+
+        return resp
+
+    async def handle(self, websocket, path: Optional[str] = None) -> None:
         """Handle one WebSocket client connection."""
+        norm_path = self.websocket_path(websocket, path)
         name = peer_name(websocket)
-        log.info("Client connected: %s", name)
+
+        log.info("Client connected: %s path=%s", name, norm_path)
 
         try:
             ok = await safe_send_json(websocket, {
                 "ok": 1,
                 "event": "connected",
                 "source": "gateway",
+                "path": norm_path,
             })
             if not ok:
                 return
@@ -401,80 +491,36 @@ class Gateway:
                     continue
 
                 if "gateway" in payload:
-                    log.info("Gateway command from %s: %s", name, payload.get("gateway"))
+                    log.info(
+                        "Gateway command from %s on %s: %s",
+                        name,
+                        norm_path,
+                        payload.get("gateway"),
+                    )
                 elif "cmd" in payload:
-                    log.info("Client %s sent Pico command: %s", name, payload.get("cmd"))
+                    log.info(
+                        "Pico command from %s on %s: %s",
+                        name,
+                        norm_path,
+                        payload.get("cmd"),
+                    )
 
-                # Gateway internal commands
-                if payload.get("gateway") == "ping":
-                    ok = await safe_send_json(websocket, {
-                        "ok": 1,
-                        "event": "gateway_pong",
-                        "source": "gateway",
-                    })
-                    if not ok:
-                        return
-                    continue
-
-                if payload.get("gateway") == "get":
-                    try:
-                        resp = await self.gateway_get()
-                    except Exception as exc:
-                        resp = json_error(str(exc))
-                    ok = await safe_send_json(websocket, resp)
-                    if not ok:
-                        return
-                    continue
-
-                if payload.get("gateway") == "map":
-                    ok = await safe_send_json(websocket, {
-                        "ok": 1,
-                        "event": "map",
-                        "source": "gateway",
-                        "map": build_pin_map(),
-                    })
-                    if not ok:
-                        return
-                    continue
-
-                if payload.get("gateway") == "subscribe":
-                    resp = await self.subscribe(websocket)
-                    ok = await safe_send_json(websocket, resp)
-                    if not ok:
-                        return
-                    continue
-
-                if payload.get("gateway") == "unsubscribe":
-                    resp = await self.unsubscribe(websocket)
-                    ok = await safe_send_json(websocket, resp)
-                    if not ok:
-                        return
-                    continue
-
-                # Forward regular commands to Pico
-                try:
-                    resp = await self.pico_send(payload)
-                except Exception as exc:
-                    log.warning("Command failure for %s: %s", name, exc)
-                    resp = json_error(str(exc))
+                if norm_path == "/monitor":
+                    resp = await self.handle_monitor(websocket, payload)
+                elif norm_path == "/control":
+                    resp = await self.handle_control(payload)
+                else:
+                    resp = json_error("unknown websocket path", path=norm_path)
 
                 ok = await safe_send_json(websocket, resp)
                 if not ok:
                     return
 
-                # Broadcast after state-changing commands
-                if (
-                    isinstance(resp, dict)
-                    and resp.get("ok") == 1
-                    and resp.get("cmd") in ("ON", "OFF", "ALLOFF")
-                ):
-                    await self.broadcast_state_update()
-
         except ConnectionClosed:
-            log.info("Client disconnected: %s", name)
+            log.info("Client disconnected: %s path=%s", name, norm_path)
         finally:
-            self.subscribers.discard(websocket)
-            log.info("Connection cleanup done: %s", name)
+            self.monitor_subscribers.discard(websocket)
+            log.info("Connection cleanup done: %s path=%s", name, norm_path)
 
 
 # ---------------------------------------------------------------------
@@ -493,6 +539,8 @@ async def main() -> None:
         WS_PORT,
     ):
         log.info("WebSocket gateway running on ws://%s:%d", WS_HOST, WS_PORT)
+        log.info("Monitor endpoint: ws://%s:%d/monitor", WS_HOST, WS_PORT)
+        log.info("Control endpoint: ws://%s:%d/control", WS_HOST, WS_PORT)
         await asyncio.Future()
 
 

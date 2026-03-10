@@ -1,0 +1,64 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Switch Matrix Monitor</title>
+    <link rel="stylesheet" href="style.css">
+</head>
+<body>
+    <main class="page">
+        <header class="topbar">
+            <div>
+                <h1>16×16 Switch Matrix Monitor</h1>
+                <p class="subtitle">Read-only real-time status monitor</p>
+            </div>
+
+            <div class="status-panel">
+                <div class="status-row">
+                    <span class="status-label">Gateway</span>
+                    <span id="ws-state" class="badge disconnected">Disconnected</span>
+                </div>
+                <div class="status-row">
+                    <span class="status-label">URI</span>
+                    <span id="ws-uri" class="value-text">-</span>
+                </div>
+                <div class="status-row">
+                    <span class="status-label">Event</span>
+                    <span id="event-state" class="value-text">-</span>
+                </div>
+                <div class="status-row">
+                    <span class="status-label">Active count</span>
+                    <span id="active-count" class="value-text">0</span>
+                </div>
+            </div>
+        </header>
+
+        <section class="toolbar-card">
+            <div class="toolbar">
+                <button id="refresh-btn" class="btn">Refresh</button>
+            </div>
+            <p class="toolbar-help">
+                This page is monitor-only. Control is handled separately by sw_control.py.
+            </p>
+        </section>
+
+        <section class="matrix-card">
+            <div class="matrix-wrapper">
+                <div id="matrix-root"></div>
+            </div>
+        </section>
+
+        <section class="active-card">
+            <h2>Active channels</h2>
+            <div id="active-list" class="active-list">(none)</div>
+        </section>
+    </main>
+
+    <script src="config.js"></script>
+    <script src="js/config_util.js"></script>
+    <script src="js/matrix_view.js"></script>
+    <script src="js/gateway_client.js"></script>
+    <script src="js/app.js"></script>
+</body>
+</html>
